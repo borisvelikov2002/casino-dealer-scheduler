@@ -37,7 +37,7 @@ To get a local copy up and running, follow these simple steps:
 
 1.  Clone the repo:
     ```sh
-    git clone https://github.com/your_username/casino-dealer-scheduler.git
+    git clone https://github.com/borisvelikov2002/casino-dealer-scheduler.git
     ```
 2.  Navigate to the project directory:
     ```sh
