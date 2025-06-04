@@ -22,6 +22,9 @@ export interface DealerAssignment {
   needsExtraRotation: boolean // Дали този дилър се нуждае от допълнителна ротация
   targetRotations: number // Целеви брой ротации за този дилър
   targetBreaks: number // Целеви брой почивки за този дилър
+  slotsWorkedSinceLastBreak: number
+  tablesWorkedSinceLastBreak: Set<string>
+  isFreshOffBreak: boolean
 }
 
 export interface ScheduleData {

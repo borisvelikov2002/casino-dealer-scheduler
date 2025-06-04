@@ -13,16 +13,11 @@ export function scheduleBreaks(
 ): void {
   const R = timeSlots.length
   const D = eligibleDealers.length
-  const dealerToTableRatio = D / Object.keys(dealerAssignments[eligibleDealers[0].id].assignedTables).length
-
-  // Създаваме проследяване на последователни ротации за всеки дилър
-  const consecutiveRotations: Record<string, number> = {}
-  eligibleDealers.forEach((dealer) => {
-    consecutiveRotations[dealer.id] = 0
-  })
+  // const dealerToTableRatio = D / Object.keys(dealerAssignments[eligibleDealers[0].id].assignedTables).length; // This needs re-evaluation if used
 
   // Създаваме масив от всички времеви слотове
   const allTimeSlots = timeSlots.map((_, index) => index)
+  const MIN_SLOTS_SAME_TABLE_BEFORE_BREAK = 3 // Configurable X, hardcoded to 3
 
   // Първо обработваме предпочитанията за първа и последна почивка
   if (preferences) {
@@ -30,11 +25,29 @@ export function scheduleBreaks(
     if (preferences.firstBreakDealers && preferences.firstBreakDealers.length > 0) {
       preferences.firstBreakDealers.forEach((dealerId) => {
         const dealer = eligibleDealers.find((d) => d.id === dealerId)
-        if (dealer) {
-          const timeSlot = timeSlots[0].time
-          schedule[timeSlot][dealerId] = "BREAK"
-          dealerAssignments[dealerId].breaks++
-          dealerAssignments[dealerId].breakPositions.push(0)
+        if (dealer && dealerAssignments[dealerId].breaks < dealerAssignments[dealerId].targetBreaks) {
+          const position = 0
+          // Проверка дали вече има почивка в този слот (може да е сложено от друг preference)
+          if (schedule[timeSlots[position].time][dealerId] === "BREAK") return
+
+          // Проверка дали може да се сложи почивка според новите правила (за слот 0)
+          const assignment = dealerAssignments[dealerId]
+          const canPlaceBreak =
+            position === 0 || // Start of shift
+            (assignment.slotsWorkedSinceLastBreak === 1 && assignment.tablesWorkedSinceLastBreak.size === 1) ||
+            (assignment.slotsWorkedSinceLastBreak >= 2 && assignment.tablesWorkedSinceLastBreak.size >= 2) ||
+            assignment.slotsWorkedSinceLastBreak >= MIN_SLOTS_SAME_TABLE_BEFORE_BREAK
+
+          if (canPlaceBreak && !assignment.isFreshOffBreak) {
+            const timeSlot = timeSlots[position].time
+            schedule[timeSlot][dealerId] = "BREAK"
+            dealerAssignments[dealerId].breaks++
+            dealerAssignments[dealerId].breakPositions.push(position)
+            console.log(`[BS_PREF_START_BREAK] Dealer ${dealer.name || dealerId} takes PREFERRED break at slot 0. DA State Update: slots=0, tables=0, isFresh=true`);
+            dealerAssignments[dealerId].slotsWorkedSinceLastBreak = 0
+            dealerAssignments[dealer.id].tablesWorkedSinceLastBreak.clear()
+            dealerAssignments[dealerId].isFreshOffBreak = true
+          }
         }
       })
     }
@@ -43,11 +56,32 @@ export function scheduleBreaks(
     if (preferences.lastBreakDealers && preferences.lastBreakDealers.length > 0) {
       preferences.lastBreakDealers.forEach((dealerId) => {
         const dealer = eligibleDealers.find((d) => d.id === dealerId)
-        if (dealer) {
-          const timeSlot = timeSlots[timeSlots.length - 1].time
-          schedule[timeSlot][dealerId] = "BREAK"
-          dealerAssignments[dealerId].breaks++
-          dealerAssignments[dealerId].breakPositions.push(timeSlots.length - 1)
+        if (dealer && dealerAssignments[dealerId].breaks < dealerAssignments[dealerId].targetBreaks) {
+          const position = timeSlots.length - 1
+          // Проверка дали вече има почивка в този слот
+          if (schedule[timeSlots[position].time][dealerId] === "BREAK") return
+
+          const assignment = dealerAssignments[dealerId]
+          // Hard Rule: Cannot place break if isFreshOffBreak is true
+          if (assignment.isFreshOffBreak) return
+
+          // Main Rule Check
+          const canPlaceBreak =
+            (assignment.slotsWorkedSinceLastBreak === 1 && assignment.tablesWorkedSinceLastBreak.size === 1) ||
+            (assignment.slotsWorkedSinceLastBreak >= 2 && assignment.tablesWorkedSinceLastBreak.size >= 2) ||
+            assignment.slotsWorkedSinceLastBreak >= MIN_SLOTS_SAME_TABLE_BEFORE_BREAK
+
+          if (canPlaceBreak) {
+            const timeSlot = timeSlots[position].time
+            schedule[timeSlot][dealerId] = "BREAK"
+            dealerAssignments[dealerId].breaks++
+            dealerAssignments[dealerId].breakPositions.push(position)
+            console.log(`[BS_PREF_END_BREAK] Dealer ${dealer.name || dealerId} takes PREFERRED break at END slot ${position}. DA State Update: slots=0, tables=0, isFresh=true`);
+            // Update state for last break (though it's end of shift)
+            dealerAssignments[dealerId].slotsWorkedSinceLastBreak = 0
+            dealerAssignments[dealerId].tablesWorkedSinceLastBreak.clear()
+            dealerAssignments[dealerId].isFreshOffBreak = true
+          }
         }
       })
     }
@@ -60,87 +94,197 @@ export function scheduleBreaks(
 
   // За всеки дилър, планираме почивките му с равномерно разпределение
   for (const dealer of sortedDealers) {
-    // Колко почивки вече са назначени от предпочитанията
-    const existingBreaks = dealerAssignments[dealer.id].breakPositions.length
-    const targetBreaks = dealerAssignments[dealer.id].targetBreaks
-    const remainingBreaks = targetBreaks - existingBreaks
+    const dealerData = dealerAssignments[dealer.id]
+    const remainingBreaks = dealerData.targetBreaks - dealerData.breaks
 
     if (remainingBreaks <= 0) continue
 
-    // Получаваме всички заети слотове (където вече има почивки)
-    const occupiedSlots = new Set<number>()
-
-    // Добавяме всички слотове, където дилърът вече има почивка
-    dealerAssignments[dealer.id].breakPositions.forEach((pos) => {
-      occupiedSlots.add(pos)
-      // Добавяме и съседните слотове, за да избегнем последователни почивки
-      occupiedSlots.add(pos - 1)
-      occupiedSlots.add(pos + 1)
+    // Получаваме всички заети слотове (където дилърът вече има почивка или не може да има)
+    const occupiedOrInvalidSlots = new Set<number>()
+    dealerData.breakPositions.forEach((pos: number) => {
+      occupiedOrInvalidSlots.add(pos)
+      occupiedOrInvalidSlots.add(pos - 1) // Prevent consecutive breaks
+      occupiedOrInvalidSlots.add(pos + 1) // Prevent consecutive breaks
     })
 
-    // Намираме всички свободни слотове
-    const availableSlots = allTimeSlots.filter((slot) => !occupiedSlots.has(slot))
+    // Simulate work to determine valid break slots
+    // This is a simplified simulation for break placement.
+    // Actual work assignment in slot-filler will update these fields definitively.
+    let tempSlotsWorked = dealerData.slotsWorkedSinceLastBreak
+    let tempTablesWorked = new Set(dealerData.tablesWorkedSinceLastBreak)
+    let tempIsFreshOffBreak = dealerData.isFreshOffBreak
 
-    // Ако няма достатъчно свободни слотове, продължаваме със следващия дилър
-    if (availableSlots.length < remainingBreaks) {
-      console.warn(
-        `Not enough available slots for dealer ${dealer.name}. Need ${remainingBreaks}, have ${availableSlots.length}`,
-      )
-      continue
-    }
+    const potentialBreakSlots: number[] = []
 
-    // Определяме минималния брой ротации преди почивка (поне 2-3 маси преди почивка)
-    const minRotationsBeforeBreak = 3
-
-    // Определяме оптималния интервал между почивките според съотношението дилъри/маси
-    let breakInterval = 0
-
-    if (dealerToTableRatio <= 1.2) {
-      // Ако имаме малко дилъри спрямо масите, почивките са по-редки
-      breakInterval = Math.floor(R / (remainingBreaks + 1))
-    } else if (dealerToTableRatio <= 1.4) {
-      // За съотношение около 1.36 (19 дилъри на 14 маси)
-      // Целим 3 маси и почивка (интервал от 6-8 слота)
-      breakInterval = Math.floor(R / (remainingBreaks + 2))
-    } else {
-      // За съотношение над 1.4 (20+ дилъри на 14 маси)
-      // Целим 2 маси и почивка (интервал от 4-6 слота)
-      breakInterval = Math.floor(R / (remainingBreaks + 3))
-    }
-
-    // Гарантираме, че интервалът е поне minRotationsBeforeBreak
-    breakInterval = Math.max(breakInterval, minRotationsBeforeBreak + 1)
-
-    // Разпределяме почивките равномерно през смяната с оптимален интервал
-    const selectedSlots = distributeBreaksEvenly(availableSlots, remainingBreaks, R, breakInterval)
-
-    // Прилагаме почивките към графика
-    for (const position of selectedSlots) {
-      // Проверяваме колко последователни ротации има преди тази позиция
-      let rotationCount = 0
-      for (let i = position - 1; i >= 0; i--) {
-        const prevSlot = timeSlots[i].time
-        const prevAssignment = schedule[prevSlot][dealer.id]
-
-        if (prevAssignment === "BREAK") {
-          break // Спираме при предишна почивка
-        } else if (prevAssignment && prevAssignment !== "-") {
-          rotationCount++
+    for (let i = 0; i < R; i++) {
+      if (occupiedOrInvalidSlots.has(i) || dealerData.breakPositions.includes(i)) {
+        if (dealerData.breakPositions.includes(i)) { // Actual break for this dealer
+          tempSlotsWorked = 0
+          tempTablesWorked.clear()
+          tempIsFreshOffBreak = true
         }
-      }
-
-      // Ако имаме твърде малко ротации преди почивка, пропускаме тази позиция
-      if (rotationCount > 0 && rotationCount < minRotationsBeforeBreak) {
-        console.log(
-          `Skipping break position ${position} for dealer ${dealer.name} due to insufficient rotations (${rotationCount})`,
-        )
         continue
       }
 
-      const timeSlot = timeSlots[position].time
-      schedule[timeSlot][dealer.id] = "BREAK"
-      dealerAssignments[dealer.id].breaks++
-      dealerAssignments[dealer.id].breakPositions.push(position)
+      // If slot 'i' is a work slot (or potential work slot)
+      // For this simulation, we assume if it's not a break, it's work.
+      // A more accurate simulation would look at schedule[timeSlots[i].time][dealer.id]
+      // but that might not be filled yet for future slots.
+
+      // Check if a break can be placed at slot 'i'
+      // Hard Rule Check:
+      if (tempIsFreshOffBreak) {
+        // Cannot place break here. Simulate work for this slot.
+        // console.log(`[BS_Simulate_BreakPlacement] Dealer ${dealer.name} slot ${i}: tempIsFreshOffBreak=true. Simulating work.`);
+        tempSlotsWorked++
+        // We don't know the table here, so add a placeholder or handle size check carefully.
+        // For simplicity, let's assume a new table is worked if variety is needed.
+        tempTablesWorked.add(`simulatedTable${i}`)
+        tempIsFreshOffBreak = false
+        continue
+      }
+
+      // Main Rule Check (for placing a break at slot 'i'):
+      const canPlaceBreak =
+        i === 0 || // Start of shift (already handled by preferences, but good for general logic)
+        (tempSlotsWorked === 1 && tempTablesWorked.size === 1) ||
+        (tempSlotsWorked >= 2 && tempTablesWorked.size >= 2) ||
+        tempSlotsWorked >= MIN_SLOTS_SAME_TABLE_BEFORE_BREAK
+
+      if (canPlaceBreak) {
+        potentialBreakSlots.push(i)
+      }
+
+      // Simulate working at slot 'i' if no break is placed there for the next iteration
+      tempSlotsWorked++
+      tempTablesWorked.add(`simulatedTable${i}`) // Placeholder
+      tempIsFreshOffBreak = false
+    }
+
+    const availableAndValidSlots = allTimeSlots.filter(
+      (slot) => !occupiedOrInvalidSlots.has(slot) && potentialBreakSlots.includes(slot),
+    )
+
+    if (availableAndValidSlots.length < remainingBreaks) {
+      console.warn(
+        `Not enough valid slots for dealer ${dealer.name} for ${remainingBreaks} breaks. Have ${availableAndValidSlots.length} after rule check. Potential: ${potentialBreakSlots.length}, Occupied/Invalid: ${occupiedOrInvalidSlots.size}`,
+      )
+      // Attempt to place with fewer slots if some are available
+      if (availableAndValidSlots.length === 0) continue
+    }
+
+    const breaksToPlace = Math.min(remainingBreaks, availableAndValidSlots.length)
+    if (breaksToPlace <= 0) continue
+
+    // The old breakInterval logic is removed. distributeBreaksEvenly will try to pick best spots.
+    // Consider a more sophisticated interval calculation if needed, or let distributeBreaksEvenly handle it.
+    const selectedSlots = distributeBreaksEvenly(availableAndValidSlots, breaksToPlace, R)
+
+    for (const position of selectedSlots) {
+      if (dealerAssignments[dealer.id].breaks >= dealerAssignments[dealer.id].targetBreaks) break
+
+      // Double check rules just before placing, using the current state from dealerAssignments
+      // This is important because previously placed breaks for the *same dealer* in this loop iteration
+      // would have updated dealerAssignments.
+      const assignment = dealerAssignments[dealer.id]
+
+      // If this position was determined based on a simulation, the actual current state
+      // might be different if a break was placed earlier in this loop for the same dealer.
+      // Re-evaluate based on last actual break or start of shift.
+      let slotsSinceActualLastBreak = 0
+      let tablesSinceActualLastBreak = new Set<string>()
+      let isActuallyFreshOffBreak = false
+      let lastBreakPos = -1
+      for(const bp of assignment.breakPositions) {
+        if (bp < position) lastBreakPos = Math.max(lastBreakPos, bp);
+      }
+
+      if (lastBreakPos !== -1) {
+        isActuallyFreshOffBreak = false; // Will be set to true *if* this position becomes a break
+        for (let k = lastBreakPos + 1; k < position; k++) {
+          const slotTime = timeSlots[k].time
+          const workAssignment = schedule[slotTime][dealer.id]
+          if (workAssignment && workAssignment !== "BREAK" && workAssignment !== "-") {
+            slotsSinceActualLastBreak++
+            tablesSinceActualLastBreak.add(workAssignment)
+            isActuallyFreshOffBreak = false;
+          } else if (workAssignment === "BREAK") { // Should not happen if occupiedSlots is correct
+            slotsSinceActualLastBreak = 0;
+            tablesSinceActualLastBreak.clear();
+            isActuallyFreshOffBreak = true;
+          }
+        }
+      } else { // No breaks before this position, count from start
+        isActuallyFreshOffBreak = false; // If first slot is break, it's fine.
+        for (let k = 0; k < position; k++) {
+          const slotTime = timeSlots[k].time
+          const workAssignment = schedule[slotTime][dealer.id]
+          if (workAssignment && workAssignment !== "BREAK" && workAssignment !== "-") {
+            slotsSinceActualLastBreak++
+            tablesSinceActualLastBreak.add(workAssignment)
+            isActuallyFreshOffBreak = false;
+          } else if (workAssignment === "BREAK") {
+             slotsSinceActualLastBreak = 0;
+             tablesSinceActualLastBreak.clear();
+             isActuallyFreshOffBreak = true;
+          }
+        }
+      }
+      // If current slot is 0, it's a valid start for a break.
+      if (position === 0) isActuallyFreshOffBreak = false;
+
+
+      // Hard Rule Check:
+      if (isActuallyFreshOffBreak && schedule[timeSlots[position -1].time][dealer.id] === "BREAK") { // Check if previous slot was a break for this dealer
+         // This implies B -> B, which should be caught by occupiedSlots.
+         // More relevant: if isFreshOffBreak from dealerAssignment is true due to a *previous* slot in the schedule.
+         // The `isFreshOffBreak` in `dealerAssignment` should reflect the state *after* the previous slot.
+         // The re-evaluation above handles this by checking work between last actual break and `position`.
+         // If `isActuallyFreshOffBreak` is true, it means `position-1` was a break.
+         // So, `schedule[timeSlots[position-1].time][dealer.id] === 'BREAK'` would make this `B->B`
+         // The primary concern for `isFreshOffBreak` is `B -> W1 -> B`.
+         // If `dealerAssignments[dealer.id].isFreshOffBreak` is true, means slot `position-1` was WORK and `position-2` was BREAK.
+         // This is the `B->W1->B` scenario.
+         // The re-calculated `slotsSinceActualLastBreak` would be 1.
+      }
+
+
+      // Main Rule Check (for placing a break at `position`):
+      const canPlaceThisBreak =
+        position === 0 || // Start of shift
+        (slotsSinceActualLastBreak === 1 && tablesSinceActualLastBreak.size === 1 && !isActuallyFreshOffBreak) || // Allow B->W1 if W1 is first work after initial break, or start of shift. Not B->W1->B
+        (slotsSinceActualLastBreak >= 2 && tablesSinceActualLastBreak.size >= 2) ||
+        (slotsSinceActualLastBreak >= MIN_SLOTS_SAME_TABLE_BEFORE_BREAK);
+
+      const da = dealerAssignments[dealer.id]; // shorthand
+
+      if (da.isFreshOffBreak && slotsSinceActualLastBreak === 1 && position > 0) {
+        // This is the B -> W1 -> B case. W1 is at position-1. Current position is candidate for B.
+        console.log(`[BS_PREVENT_BWB] Dealer ${dealer.name} at slot ${position}. DA State: slotsSinceLast=${da.slotsWorkedSinceLastBreak}, tablesSinceLast=${da.tablesWorkedSinceLastBreak.size}, isFresh=${da.isFreshOffBreak}. Recalculated for this slot: slotsActual=${slotsSinceActualLastBreak}, tablesActual=${tablesSinceActualLastBreak.size}, isActualFresh=${isActuallyFreshOffBreak}. PREVENTING BREAK.`);
+        continue;
+      }
+
+      if (canPlaceThisBreak) {
+        const timeSlot = timeSlots[position].time
+        if (schedule[timeSlot][dealer.id] === "BREAK") { // Already a break (e.g. from preferences)
+            // console.log(`[BS_DEBUG] Dealer ${dealer.name} slot ${position} already a break (pref?). Skipping.`);
+            continue;
+        }
+
+        schedule[timeSlot][dealer.id] = "BREAK"
+        da.breaks++
+        da.breakPositions.push(position)
+        da.breakPositions.sort((a,b) => a-b); // Keep sorted
+
+        console.log(`[BS_BREAK_PLACED] Dealer ${dealer.name} takes break at ${timeSlot} (slot ${position}). Prev state for this decision: slotsWorked=${slotsSinceActualLastBreak}, tablesWorked=${tablesSinceActualLastBreak.size}, isFresh(recalc)=${isActuallyFreshOffBreak}. New DA state: slots=0, tables=0, isFresh=true. Total breaks: ${da.breaks}`);
+        da.slotsWorkedSinceLastBreak = 0
+        da.tablesWorkedSinceLastBreak.clear()
+        da.isFreshOffBreak = true
+      } else {
+         console.log(
+          `[BS_SKIP_PLACEMENT] Dealer ${dealer.name} at slot ${position}. Rule fail. Slots since last (recalc): ${slotsSinceActualLastBreak}, Tables (recalc): ${tablesSinceActualLastBreak.size}, Is Fresh (recalc): ${isActuallyFreshOffBreak}. Current DA State: fresh=${da.isFreshOffBreak}, slotsWorked=${da.slotsWorkedSinceLastBreak}`
+        );
+      }
     }
   }
 }

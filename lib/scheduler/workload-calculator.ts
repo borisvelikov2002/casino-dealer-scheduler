@@ -127,6 +127,9 @@ export function initializeDealerAssignments(
       needsExtraRotation: needsExtra,
       targetRotations: targetRotations,
       targetBreaks: targetBreaks,
+      slotsWorkedSinceLastBreak: 0,
+      tablesWorkedSinceLastBreak: new Set<string>(),
+      isFreshOffBreak: false,
     }
   })
 

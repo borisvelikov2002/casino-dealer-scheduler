@@ -18,7 +18,11 @@ import { validateSchedule } from "./utils"
 // Добавяме импорт на новия валидатор
 import { validateAndFixBreaks, redistributeBreaksEvenly } from "./break-validator"
 import { validateAndFixRotations } from "./rotation-validator"
-import type { TimeSlot } from "../scheduler-types"
+import type { TimeSlot, DealerAssignment } from "../scheduler-types" // Added DealerAssignment
+import { calculateScheduleScore } from "./scoring"
+import type { ScheduleViolation } from "./scoring-types"
+
+const ITERATIVE_REFINEMENT_ITERATIONS = 30; // Increased from 10
 
 /**
  * Генерира график за дилъри с подобрен алгоритъм за ротация
@@ -88,8 +92,7 @@ export async function generateSchedule(
     // Стъпка 6: Коригираме последователните назначения на една и съща маса
     fixConsecutiveTableAssignments(eligibleDealers, timeSlots, schedule, dealerAssignments)
 
-    // Стъпка 7: Коригираме случаите, когато дилър има само 1 ротация преди почивка
-    fixSingleRotationBeforeBreak(eligibleDealers, timeSlots, schedule, dealerAssignments)
+    // Стъпка 7: (Премахнато - fixSingleRotationBeforeBreak е заменено от validateAndFixBreaks)
 
     // Стъпка 8: Финално коригиране на последователните почивки
     fixConsecutiveBreaks(eligibleDealers, timeSlots, schedule, dealerAssignments)
@@ -123,13 +126,200 @@ export async function generateSchedule(
     // Стъпка 15: Валидиране и коригиране на ротациите
     validateAndFixRotations(eligibleDealers, timeSlots, schedule, dealerAssignments)
 
-    // Валидираме графика
-    const validation = validateSchedule(schedule, dealerAssignments, timeSlots)
-    if (!validation.valid) {
-      console.warn("Schedule validation failed:", validation.errors)
+    // --- SCORING AND ITERATIVE REFINEMENT START ---
+    console.log("\n--- Initial Score Calculation ---");
+    let currentSchedule = JSON.parse(JSON.stringify(schedule));
+    let currentDealerAssignments = JSON.parse(JSON.stringify(dealerAssignments));
+
+    let { score: bestScore, violations: bestViolations } = calculateScheduleScore(
+      currentSchedule,
+      eligibleDealers,
+      currentDealerAssignments,
+      timeSlots,
+      uniqueTables, // Assuming uniqueTables are the activeTables for coverage check
+    );
+
+    console.log(`Initial Schedule Score: ${bestScore}`);
+    if (bestViolations.length > 0) {
+      console.log("Initial Violations:");
+      bestViolations.forEach(v => console.log(`  - ${v.description} (Cost: ${v.cost})`));
     }
 
-    // Извеждаме статистика за проверка
+    console.log("\n--- Starting Iterative Refinement ---");
+    for (let iter = 0; iter < ITERATIVE_REFINEMENT_ITERATIONS; iter++) {
+      let scheduleChangedInIteration = false;
+      console.log(`Iteration ${iter + 1}/${ITERATIVE_REFINEMENT_ITERATIONS}`);
+
+      // Strategy 1: Try Moving a Break
+      const randomDealerIndex = Math.floor(Math.random() * eligibleDealers.length);
+      const dealerToModify = eligibleDealers[randomDealerIndex];
+      const dealerAssignCopy = JSON.parse(JSON.stringify(currentDealerAssignments[dealerToModify.id]));
+
+      if (dealerAssignCopy.breakPositions.length > 0) {
+        const breakToMoveIndex = Math.floor(Math.random() * dealerAssignCopy.breakPositions.length);
+        const originalBreakSlotIndex = dealerAssignCopy.breakPositions[breakToMoveIndex];
+
+        // Try moving to a few alternative slots (e.g., +/- 1, 2, 3 slots)
+        for (let offset = -3; offset <= 3; offset++) {
+          if (offset === 0) continue;
+          const newBreakSlotIndex = originalBreakSlotIndex + offset;
+
+          if (newBreakSlotIndex >= 0 && newBreakSlotIndex < timeSlots.length) {
+            // Create temporary copies for this attempt
+            let tempSchedule = JSON.parse(JSON.stringify(currentSchedule));
+            let tempDealerAssignments = JSON.parse(JSON.stringify(currentDealerAssignments));
+            let tempDealerSpecificAssignment = tempDealerAssignments[dealerToModify.id];
+
+            // Check if the new slot is already a break for this dealer or creates consecutive breaks
+            const isNewSlotABreak = tempDealerSpecificAssignment.breakPositions.includes(newBreakSlotIndex);
+            const wouldBeConsecutive = tempDealerSpecificAssignment.breakPositions.includes(newBreakSlotIndex - 1) ||
+                                       tempDealerSpecificAssignment.breakPositions.includes(newBreakSlotIndex + 1);
+
+            if (tempSchedule[timeSlots[newBreakSlotIndex].time][dealerToModify.id] || isNewSlotABreak || wouldBeConsecutive) {
+              // console.log(`  [Refine_MoveBreak] Skipping move for ${dealerToModify.name}: slot ${newBreakSlotIndex} occupied, already a break, or creates consecutive.`);
+              continue;
+            }
+
+            // Apply the move in the temporary schedule
+            // 1. Remove original break
+            tempSchedule[timeSlots[originalBreakSlotIndex].time][dealerToModify.id] = "-"; // Mark as empty, to be filled by slot-filler or other logic if needed
+            tempDealerSpecificAssignment.breakPositions.splice(breakToMoveIndex, 1);
+            // Note: rotations/breaks count not changed yet, as one break is removed and one is added.
+
+            // 2. Add new break
+            tempSchedule[timeSlots[newBreakSlotIndex].time][dealerToModify.id] = "BREAK";
+            tempDealerSpecificAssignment.breakPositions.push(newBreakSlotIndex);
+            tempDealerSpecificAssignment.breakPositions.sort((a: number, b: number) => a - b);
+
+            // **Important Simplification for now**:
+            // Re-calculating slotsWorkedSinceLastBreak, tablesWorkedSinceLastBreak, isFreshOffBreak for the temp copy
+            // accurately after a move is complex. For this first pass, we rely on the main `calculateScheduleScore`
+            // to evaluate the schedule as-is. The `dealerAssignments`'s detailed state for the *copy* might be
+            // slightly off for `slotsWorkedSinceLastBreak` etc., but `breakPositions` and `rotations`/`breaks` counts are correct.
+            // The primary driver for score change here will be the direct impact of moving the break (e.g., on consecutive breaks, min work if score fn checks it).
+
+            const { score: newScore, violations: newViolations } = calculateScheduleScore(
+              tempSchedule,
+              eligibleDealers,
+              tempDealerAssignments, // Using the modified assignments for the dealer
+              timeSlots,
+              uniqueTables,
+            );
+
+            if (newScore < bestScore) {
+              console.log(`  [Refine_MoveBreak] Improvement for ${dealerToModify.name}: Moved break from slot ${originalBreakSlotIndex} to ${newBreakSlotIndex}. Score: ${bestScore} -> ${newScore}`);
+              bestScore = newScore;
+              bestViolations = newViolations;
+              currentSchedule = tempSchedule; // Keep the improved schedule
+              currentDealerAssignments = tempDealerAssignments; // Keep the improved assignments
+              scheduleChangedInIteration = true;
+              // Found a good move for this dealer, break from offset loop to try another dealer/strategy in next iter
+              break;
+            }
+          }
+        }
+      }
+      // End of "Try Moving a Break" strategy for one dealer
+
+      // Strategy 2: Try Swap Break with Work for a Dealer
+      if (!scheduleChangedInIteration && eligibleDealers.length > 0) { // Only try if no change yet in this iteration
+        const dealerForSwap = eligibleDealers[Math.floor(Math.random() * eligibleDealers.length)];
+        const assignmentsForSwap = currentDealerAssignments[dealerForSwap.id];
+
+        const breakSlots = assignmentsForSwap.breakPositions;
+        const workSlotsIndices: number[] = [];
+        for(let i=0; i<timeSlots.length; i++) {
+          const assignment = currentSchedule[timeSlots[i].time]?.[dealerForSwap.id];
+          if(assignment && assignment !== "BREAK" && assignment !== "-") {
+            workSlotsIndices.push(i);
+          }
+        }
+
+        if (breakSlots.length > 0 && workSlotsIndices.length > 0) {
+          const breakSlotIndexToSwap = breakSlots[Math.floor(Math.random() * breakSlots.length)];
+          const workSlotIndexToSwap = workSlotsIndices[Math.floor(Math.random() * workSlotsIndices.length)];
+          const tableToMove = currentSchedule[timeSlots[workSlotIndexToSwap].time][dealerForSwap.id];
+
+          // Create temporary copies
+          let tempScheduleSwap = JSON.parse(JSON.stringify(currentSchedule));
+          let tempDealerAssignmentsSwap = JSON.parse(JSON.stringify(currentDealerAssignments));
+          let tempDealerSpecificAssignSwap = tempDealerAssignmentsSwap[dealerForSwap.id];
+
+          // Validity check: ensure swap doesn't create consecutive breaks at new break location (workSlotIndexToSwap)
+          let wouldBeConsecutiveSwap = false;
+          if (workSlotIndexToSwap > 0 && tempScheduleSwap[timeSlots[workSlotIndexToSwap - 1].time]?.[dealerForSwap.id] === "BREAK") {
+            wouldBeConsecutiveSwap = true;
+          }
+          if (workSlotIndexToSwap < timeSlots.length - 1 && tempScheduleSwap[timeSlots[workSlotIndexToSwap + 1].time]?.[dealerForSwap.id] === "BREAK") {
+            wouldBeConsecutiveSwap = true;
+          }
+          // Also check original break slot is not adjacent to the workslot if they become B-B
+          if (Math.abs(breakSlotIndexToSwap - workSlotIndexToSwap) === 1) {
+             // If they are adjacent, making the work slot a break effectively makes the original break slot adjacent to a new break.
+             // The original break slot (breakSlotIndexToSwap) becomes work.
+             // The work slot (workSlotIndexToSwap) becomes break.
+             // We need to check if tempScheduleSwap[timeSlots[breakSlotIndexToSwap +/- 1].time]?.[dealerForSwap.id] === "BREAK"
+             // This is implicitly covered by the general consecutive check after the swap is made by calculateScheduleScore.
+          }
+
+
+          if (!wouldBeConsecutiveSwap) {
+            // Apply swap
+            tempScheduleSwap[timeSlots[breakSlotIndexToSwap].time][dealerForSwap.id] = tableToMove;
+            tempScheduleSwap[timeSlots[workSlotIndexToSwap].time][dealerForSwap.id] = "BREAK";
+
+            // Update breakPositions in tempDealerSpecificAssignSwap
+            const bpIdx = tempDealerSpecificAssignSwap.breakPositions.indexOf(breakSlotIndexToSwap);
+            if (bpIdx !== -1) {
+              tempDealerSpecificAssignSwap.breakPositions.splice(bpIdx, 1);
+            }
+            tempDealerSpecificAssignSwap.breakPositions.push(workSlotIndexToSwap);
+            tempDealerSpecificAssignSwap.breakPositions.sort((a: number, b: number) => a - b);
+
+            // rotations and breaks counts remain the same.
+            // Detailed state (slotsWorkedSinceLastBreak, etc.) is simplified for temp copy.
+
+            const { score: newSwapScore, violations: newSwapViolations } = calculateScheduleScore(
+              tempScheduleSwap,
+              eligibleDealers,
+              tempDealerAssignmentsSwap,
+              timeSlots,
+              uniqueTables,
+            );
+
+            if (newSwapScore < bestScore) {
+              console.log(`  [Refine_SwapBkWk] Improvement for ${dealerForSwap.name}: Swapped break at ${breakSlotIndexToSwap} with work at ${workSlotIndexToSwap} (table ${tableToMove}). Score: ${bestScore} -> ${newSwapScore}`);
+              bestScore = newSwapScore;
+              bestViolations = newSwapViolations;
+              currentSchedule = tempScheduleSwap;
+              currentDealerAssignments = tempDealerAssignmentsSwap;
+              scheduleChangedInIteration = true;
+            }
+          }
+        }
+      }
+      // End of "Try Swap Break with Work"
+
+      if(scheduleChangedInIteration) {
+        // If a change was made, maybe run some quick targeted fixes?
+        // For now, just proceed to next iteration or finish.
+      }
+    }
+    console.log(`--- Iterative Refinement Finished. Final Score: ${bestScore} ---`);
+    if (bestViolations.length > 0) {
+      console.log("Final Violations:");
+      bestViolations.forEach(v => console.log(`  - ${v.description} (Cost: ${v.cost})`));
+    }
+    // --- SCORING AND ITERATIVE REFINEMENT END ---
+
+
+    // Validate the final refined schedule
+    const validation = validateSchedule(currentSchedule, currentDealerAssignments, timeSlots)
+    if (!validation.valid) {
+      console.warn("Schedule validation failed AFTER refinement:", validation.errors)
+    }
+
+    // Извеждаме статистика за проверка (using final refined assignments)
     console.log("Dealer statistics:")
     console.log("NAME | ROTATIONS | BREAKS | UNIQUE TABLES | TOTAL SLOTS")
     console.log("-".repeat(60))
@@ -167,18 +357,25 @@ export async function generateSchedule(
     // Добавяме обобщение на общата статистика
     const totalRotations = eligibleDealers.reduce((sum, dealer) => sum + dealerAssignments[dealer.id].rotations, 0)
     const totalBreaks = eligibleDealers.reduce((sum, dealer) => sum + dealerAssignments[dealer.id].breaks, 0)
-    const totalSlots = totalRotations + totalBreaks
+    const totalSlots = totalRotations + totalBreaks // These stats are from original assignments
     const expectedTotalSlots = params.R * params.D
 
-    console.log("\nSummary Statistics:")
+    console.log("\nSummary Statistics (based on original assignments, pre-refinement for overall counts):")
     console.log(`Total Dealers: ${params.D}`)
     console.log(`Total Tables: ${params.T}`)
-    console.log(`Total Rotations: ${totalRotations} (Expected work slots: ${params.totalWorkSlots})`)
-    console.log(`Total Breaks: ${totalBreaks}`)
-    console.log(`Total Slots Assigned: ${totalSlots} (Expected: ${expectedTotalSlots})`)
-    console.log(`Coverage: ${((totalRotations / params.totalWorkSlots) * 100).toFixed(2)}%`)
+    console.log(`Total Rotations (original): ${totalRotations} (Expected work slots: ${params.totalWorkSlots})`)
+    console.log(`Total Breaks (original): ${totalBreaks}`)
+    console.log(`Total Slots Assigned (original): ${totalSlots} (Expected: ${expectedTotalSlots})`)
 
-    return schedule
+    // Recalculate final counts from best assignments for accurate final summary
+    const finalTotalRotations = eligibleDealers.reduce((sum, dealer) => sum + currentDealerAssignments[dealer.id].rotations, 0)
+    const finalTotalBreaks = eligibleDealers.reduce((sum, dealer) => sum + currentDealerAssignments[dealer.id].breaks, 0)
+    console.log(`Total Rotations (final refined): ${finalTotalRotations}`)
+    console.log(`Total Breaks (final refined): ${finalTotalBreaks}`)
+    console.log(`Coverage (final refined): ${((finalTotalRotations / params.totalWorkSlots) * 100).toFixed(2)}%`)
+
+
+    return currentSchedule // Return the best schedule found
   } catch (error) {
     console.error("Error in generateSchedule:", error)
     return {}
