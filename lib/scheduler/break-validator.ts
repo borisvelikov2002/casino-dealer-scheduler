@@ -15,8 +15,8 @@ export function validateAndFixBreaks(
   // Първо коригираме последователните почивки
   fixConsecutiveBreaks(eligibleDealers, timeSlots, schedule, dealerAssignments)
 
-  // След това коригираме почивките след единична ротация
-  fixBreaksAfterSingleRotation(eligibleDealers, timeSlots, schedule, dealerAssignments)
+  // След това коригираме нарушенията на правилото за минимална работа
+  fixMinimalWorkRuleViolations(eligibleDealers, timeSlots, schedule, dealerAssignments)
 
   // Накрая проверяваме дали всички проблеми са коригирани
   const remainingIssues = findRemainingBreakIssues(eligibleDealers, timeSlots, schedule)
@@ -40,26 +40,31 @@ function findRemainingBreakIssues(
   schedule: ScheduleData,
 ): Array<{
   dealerId: string
-  type: "consecutive" | "after_single_rotation"
+  type: "consecutive" | "minimal_work_violation" // Updated type
   index: number
 }> {
   const issues: Array<{
     dealerId: string
-    type: "consecutive" | "after_single_rotation"
+    type: "consecutive" | "minimal_work_violation" // Updated type
     index: number
   }> = []
+  const MIN_SLOTS_FOR_SINGLE_TABLE_BREAK = 3 // Ensure this matches other usages
 
   for (const dealer of eligibleDealers) {
-    let rotationCount = 0
-    let lastWasBreak = false
+    let slotsWorkedSinceLastBreak = 0
+    const tablesWorkedSinceLastBreak = new Set<string>()
+    // isFreshOffBreak means the *immediately* preceding slot was a break.
+    // We need to track this to correctly identify consecutive breaks.
+    let previousSlotWasBreak = false
+    let lastActualWorkTime = -1
 
     for (let i = 0; i < timeSlots.length; i++) {
-      const currentSlot = timeSlots[i].time
-      const assignment = schedule[currentSlot][dealer.id]
+      const currentSlotTime = timeSlots[i].time
+      const assignment = schedule[currentSlotTime][dealer.id]
 
       if (assignment === "BREAK") {
-        // Проверяваме за последователни почивки
-        if (lastWasBreak) {
+        // Check for consecutive breaks
+        if (previousSlotWasBreak) {
           issues.push({
             dealerId: dealer.id,
             type: "consecutive",
@@ -67,24 +72,81 @@ function findRemainingBreakIssues(
           })
         }
 
-        // Проверяваме за почивка след единична ротация
-        if (rotationCount === 1) {
-          issues.push({
-            dealerId: dealer.id,
-            type: "after_single_rotation",
-            index: i,
-          })
+        // Check for minimal work rule violation
+        // A break is problematic if it's not the start of the shift (i > 0) AND
+        // none of the allowed conditions for a break are met.
+        // Also, a break right after another break (consecutive) is not a min work violation in itself.
+        if (i > 0 && !previousSlotWasBreak) {
+          // B -> W1 -> B pattern:
+          // Current break is at 'i'. W1 is at 'i-1'. Previous break is at 'i-2'.
+          const isBWBViolation =
+            i >= 2 &&
+            schedule[timeSlots[i - 2]?.time]?.[dealer.id] === "BREAK" &&
+            schedule[timeSlots[i - 1]?.time]?.[dealer.id] !== "BREAK" &&
+            schedule[timeSlots[i - 1]?.time]?.[dealer.id] !== "-";
+
+          // General minimal work rule check
+          // Violated if not start, not BWB, and conditions not met
+          const violatedMinWork = !(
+            // (slotsWorkedSinceLastBreak === 1 && tablesWorkedSinceLastBreak.size === 1 && schedule[timeSlots[i-1].time]?.[dealer.id] !== undefined && i - 1 === lastActualWorkTime ) || // B -> W1 -> B (W1 must be the only work)
+            (slotsWorkedSinceLastBreak >= 2 && tablesWorkedSinceLastBreak.size >= 2) ||
+            slotsWorkedSinceLastBreak >= MIN_SLOTS_FOR_SINGLE_TABLE_BREAK
+          );
+
+          // Special handling for the B->W1->B (slot 1 case is tricky)
+          // If slotsWorkedSinceLastBreak is 1, it implies previous was work.
+          // If that work was preceded by a break, it's BWB.
+          if (isBWBViolation) {
+            issues.push({
+              dealerId: dealer.id,
+              type: "minimal_work_violation", // Specifically BWB
+              index: i,
+            });
+          } else if (slotsWorkedSinceLastBreak === 1 && tablesWorkedSinceLastBreak.size === 1 && !isBWBViolation) {
+            // This is B -> W1 -> B, but W1 is the first work slot of the shift, or first after an initial break.
+            // This is only a violation if it's NOT the very start of their work sequence after a break.
+            // The isBWBViolation should catch the problematic ones.
+            // If it's truly just one slot of work (e.g. B W B at very start of shift for dealer), it's an issue.
+            // The `scheduleBreaks` tries to prevent this.
+            // If `lastActualWorkTime` was `i-1`, and `slotsWorkedSinceLastBreak` is 1, it's a candidate.
+            // Need to ensure that the W1 was not preceded by another W.
+            // The `isBWBViolation` is more direct for the B->W1->B.
+            // A simple `slotsWorkedSinceLastBreak === 1` is problematic if not part of BWB and not the allowed exception.
+            // The allowed exception is: (dealer has worked 1 slot since last break AND tablesWorkedSinceLastBreak.size === 1)
+            // This is an issue if it's not the start of shift (i>0), and not the specific BWB pattern.
+            // This means it's W...W -> B -> W1 -> B. The first B is fine. The W1->B is the issue.
+            // This condition is covered by `violatedMinWork` if we correctly consider the "start of work segment"
+            if (violatedMinWork) {
+               issues.push({
+                dealerId: dealer.id,
+                type: "minimal_work_violation",
+                index: i,
+              });
+            }
+
+          } else if (violatedMinWork && slotsWorkedSinceLastBreak > 0) {
+            // Catch other min work violations (e.g. 0 slots, or 1 slot on 1 table when not allowed)
+            issues.push({
+              dealerId: dealer.id,
+              type: "minimal_work_violation",
+              index: i,
+            })
+          }
         }
 
-        rotationCount = 0
-        lastWasBreak = true
-      } else if (assignment && assignment !== "-") {
-        rotationCount++
-        lastWasBreak = false
+        slotsWorkedSinceLastBreak = 0
+        tablesWorkedSinceLastBreak.clear()
+        previousSlotWasBreak = true
+      } else if (assignment && assignment !== "-") { // Work slot
+        slotsWorkedSinceLastBreak++
+        tablesWorkedSinceLastBreak.add(assignment)
+        previousSlotWasBreak = false
+        lastActualWorkTime = i;
+      } else { // Empty slot or "-"
+        previousSlotWasBreak = false
       }
     }
   }
-
   return issues
 }
 
@@ -276,15 +338,15 @@ function fixConsecutiveBreaks(
 }
 
 /**
- * Коригира почивките след единична ротация
+ * Коригира нарушения на правилото за минимална работа преди/между почивки
  */
-function fixBreaksAfterSingleRotation(
+function fixMinimalWorkRuleViolations(
   eligibleDealers: DealerWithTables[],
   timeSlots: TimeSlot[],
   schedule: ScheduleData,
   dealerAssignments: Record<string, any>,
 ): void {
-  const MIN_ROTATIONS_BEFORE_BREAK = 3
+  const MIN_SLOTS_FOR_SINGLE_TABLE_BREAK = 3 // Renamed constant
   const R = timeSlots.length
 
   // Първи проход: идентифицираме почивките след единична ротация
@@ -326,54 +388,154 @@ function fixBreaksAfterSingleRotation(
     }
   }
 
-  // Ако няма почивки след единична ротация, приключваме
-  if (dealersWithSingleRotationBeforeBreak.size === 0) {
+  // Identify violations first (similar to findRemainingBreakIssues but specific to this function's scope)
+  const violationsToFix: Array<{
+    dealerId: string
+    breakIndex: number
+    currentSlotsWorked: number
+    currentTablesWorked: Set<string>
+    isBWB: boolean
+  }> = []
+
+  for (const dealer of eligibleDealers) {
+    let slotsWorked = 0
+    let tablesWorked = new Set<string>()
+    let prevSlotWasBreak = false // True if the slot just before the current one was a break
+
+    for (let i = 0; i < R; i++) {
+      const currentTimeSlot = timeSlots[i].time
+      const assignment = schedule[currentTimeSlot][dealer.id]
+
+      if (assignment === "BREAK") {
+        if (i > 0 && !prevSlotWasBreak) { // Only check if not start of shift and previous wasn't also a break
+          const isBWBPattern =
+            i >= 2 &&
+            schedule[timeSlots[i - 2]?.time]?.[dealer.id] === "BREAK" &&
+            schedule[timeSlots[i - 1]?.time]?.[dealer.id] !== "BREAK" &&
+            schedule[timeSlots[i - 1]?.time]?.[dealer.id] !== "-";
+
+          const meetsMinWorkCriteria =
+            (slotsWorked === 1 && tablesWorked.size === 1) || // B -> W1 -> B (W1 must be the only work) - this is only ok if it's not a BWB that needs fixing
+            (slotsWorked >= 2 && tablesWorked.size >= 2) ||
+            slotsWorked >= MIN_SLOTS_FOR_SINGLE_TABLE_BREAK;
+
+          if (isBWBPattern) {
+            violationsToFix.push({
+              dealerId: dealer.id,
+              breakIndex: i,
+              currentSlotsWorked: slotsWorked, // Should be 1 for BWB
+              currentTablesWorked: new Set(tablesWorked), // Should be 1 table for BWB
+              isBWB: true,
+            });
+          } else if (!meetsMinWorkCriteria && slotsWorked > 0) {
+             violationsToFix.push({
+              dealerId: dealer.id,
+              breakIndex: i,
+              currentSlotsWorked: slotsWorked,
+              currentTablesWorked: new Set(tablesWorked),
+              isBWB: false,
+            });
+          }
+        }
+        slotsWorked = 0
+        tablesWorked.clear()
+        prevSlotWasBreak = true
+      } else if (assignment && assignment !== "-") { // Work
+        slotsWorked++
+        tablesWorked.add(assignment)
+        prevSlotWasBreak = false
+      } else { // Empty
+        prevSlotWasBreak = false
+      }
+    }
+  }
+
+  if (violationsToFix.length === 0) {
+    console.log("No minimal work rule violations found to fix in this pass.")
     return
   }
 
-  console.log(`Found ${dealersWithSingleRotationBeforeBreak.size} dealers with breaks after single rotation`)
+  console.log(`Found ${violationsToFix.length} minimal work rule violations to fix.`)
 
-  // Втори проход: коригираме почивките след единична ротация
-  for (const [dealerId, breaks] of dealersWithSingleRotationBeforeBreak.entries()) {
+  for (const { dealerId, breakIndex, currentSlotsWorked, currentTablesWorked, isBWB } of violationsToFix) {
     const dealer = eligibleDealers.find((d) => d.id === dealerId)
     if (!dealer) continue
 
-    console.log(`Fixing breaks after single rotation for dealer ${dealer.name}: ${breaks.length} breaks`)
+    const currentSlotTime = timeSlots[breakIndex].time
+    console.log(
+      `[BV_FIX_ATTEMPT] Dealer ${dealer.name || dealerId} at ${timeSlots[breakIndex].formattedTime} (slot ${breakIndex}). Issue: ${isBWB ? "B->W1->B" : `Insufficient work (S:${currentSlotsWorked}, T:${currentTablesWorked.size})`}`,
+    )
 
-    for (const { breakIndex, rotationStartIndex } of breaks) {
-      const currentSlot = timeSlots[breakIndex].time
-      const rotationCount = breakIndex - rotationStartIndex
-
-      console.log(
-        `  Dealer ${dealer.name} has only ${rotationCount} rotations before break at ${timeSlots[breakIndex].formattedTime}`,
-      )
-
-      // Стратегия 1: Опитваме се да намерим достъпна маса
+    // Strategy 1: Convert problematic break to work
+    if (dealerAssignments[dealer.id].rotations < dealerAssignments[dealer.id].targetRotations) {
       const availableTables = dealer.available_tables.filter(
-        (table) => !Object.values(schedule[currentSlot]).includes(table),
-      )
+        (table) =>
+          !Object.values(schedule[currentSlotTime]).includes(table) &&
+          (breakIndex === 0 || schedule[timeSlots[breakIndex - 1].time]?.[dealer.id] !== table) &&
+          (breakIndex === R - 1 || schedule[timeSlots[breakIndex + 1].time]?.[dealer.id] !== table)
+      );
 
       if (availableTables.length > 0) {
-        // Заменяме почивката с работа на маса
-        const selectedTable = availableTables[0]
-        schedule[currentSlot][dealer.id] = selectedTable
+        const selectedTable = availableTables[0];
+        schedule[currentSlotTime][dealer.id] = selectedTable;
 
-        // Обновяваме проследяването
-        dealerAssignments[dealer.id].rotations++
-        dealerAssignments[dealer.id].breaks--
-        dealerAssignments[dealer.id].assignedTables.add(selectedTable)
+        dealerAssignments[dealer.id].rotations++;
+        dealerAssignments[dealer.id].breaks--;
+        const bPosIdx = dealerAssignments[dealer.id].breakPositions.indexOf(breakIndex);
+        if (bPosIdx !== -1) dealerAssignments[dealer.id].breakPositions.splice(bPosIdx, 1);
+        dealerAssignments[dealer.id].assignedTables.add(selectedTable);
 
-        // Премахваме от позициите на почивките
-        const breakPosIndex = dealerAssignments[dealer.id].breakPositions.indexOf(breakIndex)
-        if (breakPosIndex !== -1) {
-          dealerAssignments[dealer.id].breakPositions.splice(breakPosIndex, 1)
-        }
+        dealerAssignments[dealer.id].isFreshOffBreak = false;
 
-        console.log(`    Fixed by assigning table ${selectedTable} at ${timeSlots[breakIndex].formattedTime}`)
-        continue
+        console.log(`    [BV_FIX_APPLIED_S1] Converted break to work (${selectedTable}) for ${dealer.name || dealerId} at ${timeSlots[breakIndex].formattedTime}`);
+        continue;
+      } else {
+        console.log(`    [BV_FIX_FAIL_S1] Dealer ${dealer.name || dealerId}, break at slot ${breakIndex}: No available tables to convert break to work.`);
       }
+    } else {
+       console.log(`    [BV_FIX_SKIP_S1] Dealer ${dealer.name || dealerId}, break at slot ${breakIndex}: Already at target rotations (${dealerAssignments[dealer.id].rotations}).`);
+    }
 
-      // Стратегия 2: Опитваме се да разменим с друг дилър
+    // Strategy 2: If B->W1->B, try to convert the *other* break (slot i-2) to work
+    if (isBWB) {
+      const otherBreakIdx = breakIndex - 2;
+      if (otherBreakIdx >=0 && dealerAssignments[dealer.id].rotations < dealerAssignments[dealer.id].targetRotations) {
+        const otherBreakSlotTime = timeSlots[otherBreakIdx].time;
+        const availableTablesForOtherBreak = dealer.available_tables.filter(
+          (table) =>
+            !Object.values(schedule[otherBreakSlotTime]).includes(table) &&
+            (otherBreakIdx === 0 || schedule[timeSlots[otherBreakIdx - 1].time]?.[dealer.id] !== table) &&
+            (otherBreakIdx === R - 1 || schedule[timeSlots[otherBreakIdx + 1].time]?.[dealer.id] !== table)
+        );
+        if (availableTablesForOtherBreak.length > 0) {
+          const selectedTable = availableTablesForOtherBreak[0];
+          schedule[otherBreakSlotTime][dealer.id] = selectedTable;
+
+          dealerAssignments[dealer.id].rotations++;
+          dealerAssignments[dealer.id].breaks--;
+          const bPosIdx = dealerAssignments[dealer.id].breakPositions.indexOf(otherBreakIdx);
+          if (bPosIdx !== -1) dealerAssignments[dealer.id].breakPositions.splice(bPosIdx, 1);
+          dealerAssignments[dealer.id].assignedTables.add(selectedTable);
+          dealerAssignments[dealer.id].isFreshOffBreak = false;
+
+          console.log(`    [BV_FIX_APPLIED_S2_BWB] Converted earlier break at ${timeSlots[otherBreakIdx].formattedTime} to work (${selectedTable}) for ${dealer.name || dealerId} to resolve BWB at slot ${breakIndex}`);
+          continue;
+        } else {
+          console.log(`    [BV_FIX_FAIL_S2_BWB] Dealer ${dealer.name || dealerId}, BWB at slot ${breakIndex}: No available tables for earlier break at ${otherBreakIdx}.`);
+        }
+      } else if (isBWB && otherBreakIdx < 0) {
+         console.log(`    [BV_FIX_SKIP_S2_BWB] Dealer ${dealer.name || dealerId}, BWB at slot ${breakIndex}: Earlier break index ${otherBreakIdx} is out of bounds.`);
+      } else if (isBWB) {
+         console.log(`    [BV_FIX_SKIP_S2_BWB] Dealer ${dealer.name || dealerId}, BWB at slot ${breakIndex}: Already at target rotations, cannot convert earlier break.`);
+      }
+    }
+
+    // Log if no fix was applied by this point for the identified problem
+    console.log(
+      `    [BV_FIX_UNRESOLVED] Violation for ${dealer.name || dealerId} at ${timeSlots[breakIndex].formattedTime} (slot ${breakIndex}). Issue: ${isBWB ? "BWB" : "MinWork"}. Could not be fixed with current strategies.`,
+    );
+  }
+}
       const otherDealers = eligibleDealers.filter((d) => {
         if (d.id === dealer.id) return false
 
@@ -516,7 +678,7 @@ function fixRemainingBreakIssuesAggressively(
   dealerAssignments: Record<string, any>,
   issues: Array<{
     dealerId: string
-    type: "consecutive" | "after_single_rotation"
+    type: "consecutive" | "minimal_work_violation" // Updated type
     index: number
   }>,
 ): void {
@@ -562,9 +724,16 @@ function fixRemainingBreakIssuesAggressively(
           dealerAssignments[dealer.id].rotations++
           dealerAssignments[dealer.id].breaks--
           dealerAssignments[dealer.id].assignedTables.add(randomTable)
+          dealerAssignments[dealer.id].isFreshOffBreak = false
+          // slotsWorkedSinceLastBreak and tablesWorkedSinceLastBreak for dealer.id are complex here,
+          // but isFreshOffBreak is key for future validation passes.
 
           dealerAssignments[otherDealer.id].rotations--
           dealerAssignments[otherDealer.id].breaks++
+          dealerAssignments[otherDealer.id].isFreshOffBreak = true
+          dealerAssignments[otherDealer.id].slotsWorkedSinceLastBreak = 0
+          dealerAssignments[otherDealer.id].tablesWorkedSinceLastBreak.clear()
+
 
           // Премахваме от позициите на почивките
           const breakPosIndex = dealerAssignments[dealer.id].breakPositions.indexOf(index)
@@ -574,6 +743,8 @@ function fixRemainingBreakIssuesAggressively(
 
           // Добавяме към позициите на почивките на другия дилър
           dealerAssignments[otherDealer.id].breakPositions.push(index)
+          dealerAssignments[otherDealer.id].breakPositions.sort((a,b)=>a-b)
+
 
           console.log(`  Aggressively fixed by forcing swap with ${otherDealer.name}`)
         }
@@ -585,6 +756,7 @@ function fixRemainingBreakIssuesAggressively(
         dealerAssignments[dealer.id].rotations++
         dealerAssignments[dealer.id].breaks--
         dealerAssignments[dealer.id].assignedTables.add(randomTable)
+        dealerAssignments[dealer.id].isFreshOffBreak = false;
 
         // Премахваме от позициите на почивките
         const breakPosIndex = dealerAssignments[dealer.id].breakPositions.indexOf(index)

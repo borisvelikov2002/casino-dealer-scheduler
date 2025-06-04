@@ -107,6 +107,13 @@ export function fillWorkSlots(
         dealerAssignments[selectedDealer.id].lastTableIndex = rotationIndex
         dealerAssignments[selectedDealer.id].assignedTables.add(table)
 
+        const da = dealerAssignments[selectedDealer.id];
+        const prevSlots = da.slotsWorkedSinceLastBreak; // For logging
+        da.slotsWorkedSinceLastBreak++
+        da.tablesWorkedSinceLastBreak.add(table)
+        da.isFreshOffBreak = false
+        console.log(`[SF_FILL_WORK_SLOT] Dealer ${selectedDealer.name || selectedDealer.id} assigned to ${table} at slot ${rotationIndex}. Prev Slots: ${prevSlots}, New DA State: slotsWorked=${da.slotsWorkedSinceLastBreak}, tablesWorked=${da.tablesWorkedSinceLastBreak.size}, isFresh=${da.isFreshOffBreak}`);
+
         // Обновяваме последното назначение за масата
         tableLastAssignedDealer[table] = { dealerId: selectedDealer.id, timeIndex: rotationIndex }
 
@@ -254,13 +261,25 @@ export function fillRemainingSlots(
         dealerAssignments[dealer.id].lastTableIndex = slotIndex
         dealerAssignments[dealer.id].assignedTables.add(selectedTable)
 
+        const daFill = dealerAssignments[dealer.id];
+        const prevSlotsFill = daFill.slotsWorkedSinceLastBreak; // For logging
+        daFill.slotsWorkedSinceLastBreak++
+        daFill.tablesWorkedSinceLastBreak.add(selectedTable)
+        daFill.isFreshOffBreak = false
+        console.log(`[SF_REMAINING_WORK] Dealer ${dealer.name || dealer.id} assigned to ${selectedTable} at slot ${slotIndex}. Prev Slots: ${prevSlotsFill}, New DA State: slotsWorked=${daFill.slotsWorkedSinceLastBreak}, tablesWorked=${daFill.tablesWorkedSinceLastBreak.size}, isFresh=${daFill.isFreshOffBreak}`);
+
         // Обновяваме последното назначение
         dealerLastAssignedTable[dealer.id] = { table: selectedTable, timeIndex: slotIndex }
       } else {
         // Ако няма достъпна маса, даваме почивка
         schedule[currentSlot][dealer.id] = "BREAK"
-        dealerAssignments[dealer.id].breaks++
-        dealerAssignments[dealer.id].breakPositions.push(slotIndex)
+        const daBreak = dealerAssignments[dealer.id];
+        daBreak.breaks++
+        daBreak.breakPositions.push(slotIndex)
+        console.log(`[SF_REMAINING_BREAK] Dealer ${dealer.name || dealer.id} takes BREAK at slot ${slotIndex} (no table). Prev DA state: slotsWorked=${daBreak.slotsWorkedSinceLastBreak}, tables=${daBreak.tablesWorkedSinceLastBreak.size}, isFresh=${daBreak.isFreshOffBreak}. New DA state: slots=0, tables=0, isFresh=true`);
+        daBreak.slotsWorkedSinceLastBreak = 0
+        daBreak.tablesWorkedSinceLastBreak.clear()
+        daBreak.isFreshOffBreak = true
       }
     }
   }
@@ -271,8 +290,13 @@ export function fillRemainingSlots(
       const slot = timeSlots[i].time
       if (!schedule[slot][dealer.id]) {
         schedule[slot][dealer.id] = "BREAK"
-        dealerAssignments[dealer.id].breaks++
-        dealerAssignments[dealer.id].breakPositions.push(i)
+        const daEnsureEmpty = dealerAssignments[dealer.id];
+        daEnsureEmpty.breaks++
+        daEnsureEmpty.breakPositions.push(i)
+        console.log(`[SF_ENSURE_EMPTY_BREAK] Dealer ${dealer.name || dealer.id} takes BREAK at slot ${i} (empty). Prev DA state: slotsWorked=${daEnsureEmpty.slotsWorkedSinceLastBreak}, tables=${daEnsureEmpty.tablesWorkedSinceLastBreak.size}, isFresh=${daEnsureEmpty.isFreshOffBreak}. New DA state: slots=0, tables=0, isFresh=true`);
+        daEnsureEmpty.slotsWorkedSinceLastBreak = 0
+        daEnsureEmpty.tablesWorkedSinceLastBreak.clear()
+        daEnsureEmpty.isFreshOffBreak = true
       }
     }
   }
@@ -320,6 +344,12 @@ export function ensureCompleteAssignments(
             schedule[currentSlot][dealer.id] = "BREAK"
             dealerAssignments[dealer.id].breaks++
             dealerAssignments[dealer.id].breakPositions.push(rotationIndex)
+
+            const daEnsureComplete = dealerAssignments[dealer.id];
+            console.log(`[SF_ENSURE_COMPLETE_BREAK] Dealer ${dealer.name || dealer.id} takes BREAK at slot ${rotationIndex} (incomplete). Prev DA state: slotsWorked=${daEnsureComplete.slotsWorkedSinceLastBreak}, tables=${daEnsureComplete.tablesWorkedSinceLastBreak.size}, isFresh=${daEnsureComplete.isFreshOffBreak}. New DA state: slots=0, tables=0, isFresh=true`);
+            daEnsureComplete.slotsWorkedSinceLastBreak = 0
+            daEnsureComplete.tablesWorkedSinceLastBreak.clear()
+            daEnsureComplete.isFreshOffBreak = true
 
             if (dealerAssignments[dealer.id].rotations + dealerAssignments[dealer.id].breaks >= R) {
               break
